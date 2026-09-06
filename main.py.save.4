@@ -1,0 +1,318 @@
+import os
+import discord
+import asyncio
+import json
+import sqlite3
+from google import genai
+from google.genai import types
+from ddgs import DDGS
+
+# === SCRIPT MEMORI SAVE FILE ===
+SAVE_FILE = "bot_memory_save.json"
+
+def load_save_data():
+    if not os.path.exists(SAVE_FILE):
+        return {}
+    try:
+        with open(SAVE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def safe_save_user_memory(user_id, data_dict):
+    saves = load_save_data()
+    saves[str(user_id)] = data_dict
+    
+    temp_file = f"{SAVE_FILE}.tmp"
+    with open(temp_file, "w") as f:
+        json.dump(saves, f, indent=4)
+    os.replace(temp_file, SAVE_FILE)
+
+# === SETUP API & DATABASE WOS ===
+GEMINI_API_KEY = "AQ.Ab8RN6JUj20USS_ZSHAfbBAhQkgUYHTytMMMXINVMnTHeYUgtA"
+genai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+DB_DIR = os.path.expanduser("~/DiscordBotv4/db")
+
+def query_wos_db(db_name, query, params=()):
+    db_path = os.path.join(DB_DIR, db_name)
+    if not os.path.exists(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        results = cursor.fetchall()
+        conn.close()
+        return results
+    except Exception as e:
+        print(f"Error reading {db_name}: {e}")
+        return None
+
+# === SYSTEM INSTRUCTION TEKS UTAMA ===
+system_instruction_text = """
+[ATURAN UTAMA - DILARANG SPAM WOS]
+- JANGAN PERNAH membawa-bawa, menyebutkan, atau mengaitkan obrolan ke game Whiteout Survival (WOS) JIKA USER TIDAK SECARA EKSPLISIT MEMBAHAS/MENANYAKAN WOS!
+- Jika obrolan bersifat santai, random, bercanda, curhat, atau tugas umum, JAWAB SESUAI TOPIK USER SAJA. Dilarang keras sok tahu mengaitkan ke aliansi, rally, atau fitur WOS!
+
+[ATURAN PANGGILAN NAMA USER - SANGAT KETAT]
+- Panggilan 'beb' HANYA berlaku untuk user yang memanggil kamu (Beban).
+- Kamu (Beban) HARAM/DILARANG KERAS memanggil balik user dengan sebutan 'beb', 'bebs', 'baby', 'sayang', atau panggilan mesra sejenisnya!
+- PANGGIL USER HANYA menggunakan nama/display name mereka yang tertera di penanda '[USER SAAT INI YANG SEDANG BICARA]' (Atau julukan khusus jika ada di '[INGATAN TENTANG USER INI]').
+
+[KONTEN SERVER DISCORD]
+- Nama server Discord ini adalah 'Gorengan'. 
+- Jika user menyebutkan 'member gorengan' atau 'anak-anak gorengan', yang dimaksud adalah ANGGOTA/MEMBER SERVER DISCORD INI!
+- Kamu WAJIB menyebutkan nama-nama member yang tertera pada blok '[DATA MEMBER SERVER DISCORD GORENGAN]' jika diminta user! Sebutkan dipisah Online & Offline secara rapi.
+- Gunakan emoji custom server yang ada di blok '[EMOJI CUSTOM SERVER GORENGAN]' secara alami dalam balasan pesanmu jika cocok dengan konteks ekspresi!
+
+[GAYA BICARA & PERAN BOT]
+- Respon ramah, santai, dan natural ala teman se-server (pake gue-lu/kamu-aku).
+- DIRECT TO THE POINT: Jawab langsung ke inti pertanyaan (1-3 kalimat untuk pertanyaan singkat).
+
+[BATASAN WEWENANG]
+- Kamu tidak bisa melakukan tindakan admin (kick/ban/edit channel). Tapi kalau sekadar membaca dan menyebutkan list member server, KAMU BISA DAN SANGAT BOLEH!"""
+
+# Channel ID Khusus WOS (Bot & Giftcode)
+ALLOWED_CHANNEL_IDS = [1459706485838971014, 1443666352177938553]
+WOS_BOT_TARGET_CHANNEL_ID = 1459706485838971014
+
+async def gemini_chat_async(contents_payload):
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction_text,
+        temperature=0.2
+    )
+    
+    def _call_api():
+        response = genai_client.models.generate_content(
+            model='gemini-3.1-flash-lite',
+            contents=contents_payload,
+            config=config
+        )
+        return response.text
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _call_api)
+
+import requests
+
+def search_web_image(query):
+    """Mencari gambar di web dan mengunduhnya ke file lokal agar tidak terhadang hotlink/error Wikimedia"""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        with DDGS(headers=headers) as ddgs:
+            results = list(ddgs.images(query, max_results=5))
+            
+            for item in results:
+                img_url = item.get('image')
+                if "upload.wikimedia.org" in img_url and "px-" in img_url:
+                    continue
+                
+                try:
+                    resp = requests.get(img_url, headers=headers, timeout=5)
+                    if resp.status_code == 200 and len(resp.content) > 1000:
+                        temp_path = "temp_search.jpg"
+                        with open(temp_path, "wb") as f:
+                            f.write(resp.content)
+                        return temp_path
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"[ERROR DDG IMAGE SEARCH]: {e}")
+    return None
+
+# === SETUP DISCORD CLIENT & INTENTS LENGKAP ===
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.presences = True
+
+client = discord.Client(intents=intents)
+chat_histories = {}
+
+@client.event
+async def on_ready():
+    print("=============================================")
+    print(f"Bot Discord (Beban AI Friendly) Online: {client.user}")
+    print("=============================================")
+
+@client.event
+async def on_message(message):
+    if message.author == client.user:
+        return
+
+    channel_id = message.channel.id
+    is_dm = isinstance(message.channel, discord.DMChannel)
+    is_wos_channel = channel_id in ALLOWED_CHANNEL_IDS
+    is_mentioned = client.user in message.mentions
+
+    if is_mentioned or is_dm or is_wos_channel:
+        if channel_id not in chat_histories:
+            chat_histories[channel_id] = []
+
+        raw_input = message.content.replace(f'<@{client.user.id}>', '').strip()
+        if not raw_input:
+            raw_input = "halo"
+
+        sender_name = message.author.display_name
+        user_id = str(message.author.id)
+        msg_lower = raw_input.lower()
+
+        print(f"[LOG] Pesan masuk dari {sender_name} ({message.author.name}): {raw_input}")
+
+        # === 1. FITUR GENERATE GAMBAR AI (!gambar / !draw) ===
+        if raw_input.startswith("!gambar ") or raw_input.startswith("!draw "):
+            prompt_gambar = raw_input.split(" ", 1)[1]
+            await message.channel.send(f"Bentar ya {sender_name}, Beban lagi gambarin: *{prompt_gambar}*...")
+            
+            try:
+                result = genai_client.models.generate_images(
+                    model='imagen-3.0-generate-002',
+                    prompt=prompt_gambar,
+                    config=dict(number_of_images=1, output_mime_type="image/jpeg")
+                )
+                
+                for generated_image in result.generated_images:
+                    image_path = f"temp_{user_id}.jpg"
+                    with open(image_path, "wb") as f:
+                        f.write(generated_image.image.image_bytes)
+                    
+                    await message.channel.send(file=discord.File(image_path))
+                    
+                    if os.path.exists(image_path):
+                        os.remove(image_path)
+                    return
+            except Exception as err_img:
+                print(f"[ERROR GAMBAR AI]: {err_img}")
+                await message.channel.send("Waduh maaf, lagi gagal bikin gambarnya nih. Coba deskripsi lain deh!")
+                return
+
+        # === 2. FITUR CARI GAMBAR ASLI DI WEB (AUTO-SEARCH) ===
+        is_web_img_req = any(kw in msg_lower for kw in ["cari gambar", "cariin gambar", "lihat gambar", "liat gambar", "foto dari", "cari foto", "foto asli", "gambar dari"])
+        if is_web_img_req:
+            await message.channel.send(f"Bentar ya {sender_name}, Beban cariin foto/gambarnya di internet...")
+            
+            # Ekstrak kata kunci objek pencarian
+            clean_search_query = raw_input
+            for kw in ["cari gambar", "cariin gambar", "lihat gambar", "liat gambar", "foto dari", "cari foto", "foto asli", "gambar dari", "dong", "tolong", "beban"]:
+                clean_search_query = clean_search_query.lower().replace(kw, "").strip()
+
+            img_url = search_web_image(clean_search_query)
+            if img_url:
+                embed = discord.Embed(title=f"Hasil pencarian gambar: {clean_search_query}")
+                embed.set_image(url=img_url)
+                await message.channel.send(embed=embed)
+                return
+            else:
+                await message.channel.send("Duh maaf, Beban nggak nemu gambar yang pas di internet euy.")
+
+        # === 3. FITUR PERANTARA REGIS WOS KE #WOS-BOT ===
+        if any(kw in msg_lower for kw in ["regis wos", "daftar wos", "registrasi wos"]):
+            try:
+                extract_prompt = f"Ekstrak HANYA angka ID Player WOS dan angka State dari pesan ini: '{raw_input}'. Format jawaban WAJIB HANYA: <ID> <STATE> (contoh: 147513740 1467). Jika tidak lengkap, jawab 'GAGAL'."
+                ext_res = genai_client.models.generate_content(
+                    model='gemini-3.1-flash-lite',
+                    target_chan = client.get_channel(WOS_BOT_TARGET_CHANNEL_ID)
+                    if target_chan:
+                        await target_chan.send(clean_ext)
+                        await message.channel.send(f"Sip {sender_name}, pesan registrasi `{clean_ext}` udah Beban kirimkan langsung ke channel <#{WOS_BOT_TARGET_CHANNEL_ID}>! Tinggal tunggu dibaca GorenganWOSbot ya.")
+                        return
+            except Exception as err_wos_reg:
+                print(f"[ERROR PERANTARA REGIS WOS]: {err_wos_reg}")
+
+        # === 4. KUMPULKAN DATA MEMBER (ONLINE/OFFLINE) & EMOJI CUSTOM SERVER ===
+        online_members = []
+        offline_members = []
+
+        if message.guild:
+            for m in message.guild.members:
+                if not m.bot:
+                    if m.status != discord.Status.offline:
+                        online_members.append(m.display_name)
+                    else:
+                        offline_members.append(m.display_name)
+
+        user_saves = load_save_data()
+
+        prompt_blocks = [
+            f"[USER SAAT INI YANG SEDANG BICARA]: {sender_name}",
+            f"[PESAN USER]: {raw_input}"
+        ]
+
+        member_data_text = f"Online ({len(online_members)}): {', '.join(online_members) if online_members else 'Tidak ada'} | Offline ({len(offline_members)}): {', '.join(offline_members) if offline_members else 'Tidak ada'}"
+        prompt_blocks.append(f"[DATA MEMBER SERVER DISCORD GORENGAN]: {member_data_text}")
+
+        # Ambil daftar emoji custom server
+        if message.guild:
+            custom_emojis = [f"<:{e.name}:{e.id}>" for e in message.guild.emojis]
+            if custom_emojis:
+                prompt_blocks.append(f"[EMOJI CUSTOM SERVER GORENGAN]: {', '.join(custom_emojis)}")
+
+        saved_info = user_saves.get(user_id, {})
+        if saved_info:
+            prompt_blocks.append(f"[INGATAN TENTANG USER INI]: {saved_info}")
+
+        # Filter database WOS
+        if is_wos_channel or "wos" in msg_lower:
+            if "bear" in msg_lower:
+                res = query_wos_db("beartime.sqlite", "SELECT * FROM beartime LIMIT 5;")
+                if res:
+                    prompt_blocks.append(f"[SISTEM DATA BEAR WOS]: {res}")
+            elif "code" in msg_lower or "kode" in msg_lower or "giftcode" in msg_lower:
+                res = query_wos_db("giftcode.sqlite", "SELECT * FROM gift_codes LIMIT 5;")
+                if res:
+                    prompt_blocks.append(f"[SISTEM DATA GIFTCODE WOS]: {res}")
+
+        final_user_input = "\n".join(prompt_blocks)
+
+        # === 5. KIRIM KE GEMINI ===
+        user_turn = {'role': 'user', 'parts': [{'text': final_user_input}]}
+        chat_histories[channel_id].append(user_turn)
+
+        if len(chat_histories[channel_id]) > 10:
+            chat_histories[channel_id] = chat_histories[channel_id][-10:]
+
+        async with message.channel.typing():
+            try:
+                bot_reply = await gemini_chat_async(chat_histories[channel_id])
+
+                if not bot_reply or not bot_reply.strip():
+                    bot_reply = "Halo! Ada yang mau dibahas atau ditanyain?"
+
+                model_turn = {'role': 'model', 'parts': [{'text': bot_reply}]}
+                chat_histories[channel_id].append(model_turn)
+
+                # === 6. AUTO-SAVE JULUKAN & MEMORI USER ===
+                try:
+                    check_prompt = f"Dari pesan user ini: '{raw_input}', apakah user meminta dipanggil dengan nama/gelar/julukan khusus? Jika YA, jawab HANYA dengan nama/gelar tersebut (misal: 'Kaisar', 'Princess', 'Ayang'). Jika TIDAK ada, jawab HANYA 'TIDAK'."
+                    check_res = genai_client.models.generate_content(
+                        model='gemini-3.1-flash-lite',
+                        contents=check_prompt
+                    )
+                    extracted_title = check_res.text.strip()
+
+                    if "TIDAK" not in extracted_title.upper() and len(extracted_title) < 30:
+                        if extracted_title.lower() not in ["beb", "bebs", "baby", "sayang"]:
+                            user_data = user_saves.get(user_id, {})
+                            user_data["panggilan_khusus"] = extracted_title
+                            user_data["username"] = message.author.name
+                            safe_save_user_memory(user_id, user_data)
+                            print(f"[SAVE MEMORY] {message.author.name} disimpan sebagai: {extracted_title}")
+                except Exception as err_save:
+                    print(f"[WARN Auto-Save Failed]: {err_save}")
+
+                await message.channel.send(bot_reply)
+                print("[LOG] Berhasil membalas via Gemini!")
+
+            except Exception as e:
+                print(f"[ERROR Gemini] {e}")
+                if chat_histories[channel_id]:
+                    chat_histories[channel_id].pop()
+                await message.channel.send("Eh maaf, lagi ada sedikit kendala koneksi nih. Coba tanya lagi ya!")
+
+DISCORD_TOKEN = "MTUzMzY3ODgwMzc0NDg0OTk5MA.GTdBHZ.UxrQvJR43b_2uSeZKgNOzdA-ygune_EvxjL94s"
+
+if __name__ == "__main__":
+    client.run(DISCORD_TOKEN)
